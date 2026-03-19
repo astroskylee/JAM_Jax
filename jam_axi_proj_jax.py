@@ -23,6 +23,7 @@ Vx.x.x: Additional changes are documented in the CHANGELOG of the JamPy package.
 """
 from jax.tree_util import Partial as partial
 import time
+import numpy as np
 import jax
 jax.config.update('jax_enable_x64', True)
 import jax.numpy as jnp
@@ -253,7 +254,8 @@ def psf_conv(x, y, inc_deg,
              surf_lum, sigma_lum, qobs_lum,
              surf_pot, sigma_pot, qobs_pot,
              mbh, beta, gamma, logistic, moment, align, sigmaPsf, normPsf,
-             pixSize, pixAng, step, nrad, nang, nlos, epsrel, interp, analytic_los):
+             pixSize, pixAng, step, nrad, nang, nlos, epsrel, interp, analytic_los,
+             nx=500, ny=500, nk=100, psf_convolution=None):
     """
     This routine gives the velocity moment after convolution with a PSF.
     The convolution is done using interpolation of the model on a
@@ -277,14 +279,13 @@ def psf_conv(x, y, inc_deg,
 
     # Define parameters of polar grid for interpolation
     w = sigma_lum < jnp.max(jnp.abs(x))  # Characteristic MGE axial ratio in observed range
-    #qmed = jnp.median(qobs_lum) if w.sum() < 3 else jnp.median(qobs_lum[w])
-    ####################Change the if statement to use nanmedian plus jnp.select###############
-    #This is a work for concreate boolean sums which numpyro hates
-    qmed = jax.lax.select(w.sum() < 3, jnp.nanmedian(jnp.where(w, qobs_lum, jnp.nan)), jnp.median(qobs_lum))
+    qmed_all = jnp.median(qobs_lum)
+    qmed_masked = jnp.nanmedian(jnp.where(w, qobs_lum, jnp.nan))
+    qmed = jax.lax.select(w.sum() < 3, qmed_all, qmed_masked)
     rell = jnp.sqrt(x**2 + (y/qmed)**2)  # Elliptical radius of input (x, y)
 
-    # psf_convolution = (jnp.max(sigmaPsf) > 0) and (pixSize > 0)
-    psf_convolution  = True
+    if psf_convolution is None:
+        psf_convolution = (jnp.max(sigmaPsf) > 0) and (pixSize > 0)
 
    
     if not interp or ((nrad*nang > x.size) and (not psf_convolution)):  # Just calculate values
@@ -301,8 +302,7 @@ def psf_conv(x, y, inc_deg,
         # Kernel half size is the sum of 3*sigma(max) and 1/2 pixel diagonal.
 
         if psf_convolution:         # PSF convolution
-            #if step == 0:
-            step = jnp.min(sigmaPsf)/4
+            step = jax.lax.select(step == 0, jnp.min(sigmaPsf)/4, step)
             mx = 3*jnp.max(sigmaPsf) + pixSize/jnp.sqrt(2)
         else:                       # No convolution
             step = jnp.min(rell)     # Minimum radius
@@ -347,10 +347,10 @@ def psf_conv(x, y, inc_deg,
     t0 = time.time()
     if interp and psf_convolution:  # PSF convolution
 
-        # nx = int(jnp.ceil(rmax/step))
-        # ny = int(jnp.ceil(rmax*qmed/step))
-        nx = 500
-        ny = 500
+        nx = int(nx)
+        ny = int(ny)
+        nx = max(nx, 1)
+        ny = max(ny, 1)
         #print(nx, ny)
         x1 = jnp.linspace(0.5 - nx, nx - 0.5, 2*nx)*step
         y1 = jnp.linspace(0.5 - ny, ny - 0.5, 2*ny)*step
@@ -370,8 +370,8 @@ def psf_conv(x, y, inc_deg,
         elif moment == 'x':
             model_car *= jnp.sign(y_car)
         
-        #nk = int(jnp.ceil(mx/step))
-        nk = 100
+        nk = int(nk)
+        nk = max(nk, 1)
         #print(nk)
         kgrid = jnp.linspace(-nk, nk, 2*nk + 1)*step
         xgrid, ygrid = jnp.meshgrid(kgrid, kgrid)  # Kernel is square
@@ -847,6 +847,11 @@ class jam_axi_proj:
 
     ###########################################################################
     """
+
+    def __init__(self):
+        quad_name = getattr(nq, "DEFAULT_QUAD_NAME", "logspace_segmentation")
+        seg = getattr(nq, "DEFAULT_SEGMENTS", 8)
+        print(f"[jam_axi_proj_jax] using {quad_name}, seg = {seg}")
     
     @staticmethod
     def get_kinematics( surf_lum, sigma_lum, qobs_lum, surf_pot, sigma_pot,
@@ -856,7 +861,7 @@ class jam_axi_proj:
                  interp=True, kappa=None, logistic=False, ml=None, moment='zz',
                  nang=10, nlos=1500, nodots=False, normpsf=1., nrad=20,
                  pixang=0., pixsize=0., quiet=False, rbh=0.01,
-                 sigmapsf=0., step=0.):
+                 sigmapsf=0., step=0., nx=500, ny=500, nk=100):
 
         str1 = ['x', 'y', 'z']
         str2 =  ['xx', 'yy', 'zz', 'xy', 'xz', 'yz']
@@ -890,6 +895,15 @@ class jam_axi_proj:
                 # assert jnp.any(goodbins), "goodbins must contain some True values"
             # assert xbin.size == data.size == errors.size == goodbins.size, \
                 # "(rms, erms, goodbins) and (xbin, ybin) do not match"
+
+        # Keep this boolean as a Python scalar to avoid tracer->bool issues inside NumPyro/JAX tracing.
+        try:
+            sigmapsf_np = np.atleast_1d(np.asarray(sigmapsf, dtype=float))
+            pixsize_val = float(pixsize)
+            psf_convolution_flag = bool((sigmapsf_np.max() > 0.0) and (pixsize_val > 0.0))
+        except Exception:
+            # Conservative fallback when values are not concretely available at Python trace time.
+            psf_convolution_flag = True
 
         sigmapsf = jnp.atleast_1d(sigmapsf)
         normpsf = jnp.atleast_1d(normpsf)
@@ -939,7 +953,7 @@ class jam_axi_proj:
             surf_pot_pc, sigma_pot_pc, qobs_pot,
             mbh, beta, gamma, logistic, moment, align, sigmaPsf_pc, normpsf,
             pixSize_pc, pixang, step_pc, nrad, nang, nlos, epsrel,
-            interp, analytic_los)
+            interp, analytic_los, nx=nx, ny=ny, nk=nk, psf_convolution=psf_convolution_flag)
 
         if moment in str2[:3]:
             model = jnp.sqrt(model.clip(0))  # sqrt and clip to allow for rounding errors
@@ -1050,4 +1064,3 @@ class jam_axi_proj:
         plt.subplots_adjust(wspace=0.03)
 
 ##############################################################################
-

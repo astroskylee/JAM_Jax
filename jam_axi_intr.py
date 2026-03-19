@@ -24,10 +24,22 @@ Vx.x.x: Additional changes are documented in the CHANGELOG of the JamPy package.
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import numpy as np
 from jax.scipy import ndimage
 from time import perf_counter as clock
 from plotbin.plot_velfield import plot_velfield
 import nquad as nq
+
+##############################################################################
+
+def _has_component_variation(values):
+    """Best-effort static check for per-Gaussian anisotropy variation."""
+    try:
+        return bool(np.ptp(np.asarray(values)))
+    except Exception:
+        # Traced values are not concrete during NumPyro/NUTS compilation.
+        # Fall back to the more general tensor-integral branch.
+        return True
 
 ##############################################################################
 
@@ -249,7 +261,7 @@ def integrand_sph(s, t, r, th, dens_lum, sigma_lum, qintr_lum, beta, gamma,
         fun *= ((1 + (r1/rab)**alpha)/(1 + (r/rab)**alpha))**(2*(betainf - beta0)/alpha)
         beta = beta0 + (betainf - beta0)/(1 + (rab/r)**alpha)
     else:               # Constant anisotropy, different per Gaussian
-        beta = beta[:, None, None] if jnp.ptp(beta) else beta[0]
+        beta = jnp.where(jnp.ptp(beta), beta[:, None, None], beta[0])
         fun = (r1/r)**(2*beta)
 
     # Tracer Gaussians
@@ -278,7 +290,7 @@ def integrand_sph(s, t, r, th, dens_lum, sigma_lum, qintr_lum, beta, gamma,
             rag, gamma0, gammainf, alpha = gamma
             gamma = gamma0 + (gammainf - gamma0)/(1 + (rag/r)**alpha)
         else:           # Constant anisotropy, different per Gaussian
-            gamma = gamma[:, None, None] if jnp.ptp(gamma) else gamma[0]  # Anisotropy gamma = 1 - (sig_phi/sig_R)**2
+            gamma = jnp.where(jnp.ptp(gamma), gamma[:, None, None], gamma[0])  # Anisotropy gamma = 1 - (sig_phi/sig_R)**2
         integ = psi*(1 - gamma)
     elif component == 'v2phi':
         integ = psi*(1 - beta)*(1 + 2*(bb + dd))
@@ -345,21 +357,24 @@ def intrinsic_moments_sph(R, z,
     args = [r, th, dens_lum, sigma_lum, qintr_lum, beta, gamma, logistic]
     args_mge = args + [dens_pot, sigma_pot, qintr_pot]
     nu = density(R, z, dens_lum, sigma_lum, qintr_lum).sum(-1)
+    varying_beta = _has_component_variation(beta)
+    varying_gamma = _has_component_variation(gamma)
 
-    sig2r = nq.nquad(integrand_sph, xlim, ylim, args=args_mge+['sig2r'])/nu
-    v2phi = nq.nquad(integrand_sph, xlim, ylim, args=args_mge+['v2phi'])/nu
+    ranges_2d = jnp.stack([xlim, ylim])
+    sig2r = nq.nquad(integrand_sph, ranges_2d, args=args_mge+['sig2r'])/nu
+    v2phi = nq.nquad(integrand_sph, ranges_2d, args=args_mge+['v2phi'])/nu
 
     if mbh > 0:
         args_bh = args + [mbh]
-        sig2r += nq.quad(integrand_sph_bh, ylim, args=args_bh+['sig2r'])/nu
-        v2phi += nq.quad(integrand_sph_bh, ylim, args=args_bh+['v2phi'])/nu
+        sig2r += jnp.squeeze(nq.quad(integrand_sph_bh, ylim, args=args_bh+['sig2r']))/nu
+        v2phi += jnp.squeeze(nq.quad(integrand_sph_bh, ylim, args=args_bh+['v2phi']))/nu
 
-    if (not logistic) and (jnp.ptp(beta) or jnp.ptp(gamma)):
-        sig2th = nq.nquad(integrand_sph, xlim, ylim, args=args_mge+['sig2th'])/nu
-        sig2phi = nq.nquad(integrand_sph, xlim, ylim, args=args_mge+['sig2phi'])/nu
+    if (not logistic) and (varying_beta or varying_gamma):
+        sig2th = nq.nquad(integrand_sph, ranges_2d, args=args_mge+['sig2th'])/nu
+        sig2phi = nq.nquad(integrand_sph, ranges_2d, args=args_mge+['sig2phi'])/nu
         if mbh > 0:
-            sig2th += nq.quad(integrand_sph_bh, ylim, args=args_bh+['sig2th'])/nu
-            sig2phi += nq.quad(integrand_sph_bh, ylim, args=args_bh+['sig2phi'])/nu
+            sig2th += jnp.squeeze(nq.quad(integrand_sph_bh, ylim, args=args_bh+['sig2th']))/nu
+            sig2phi += jnp.squeeze(nq.quad(integrand_sph_bh, ylim, args=args_bh+['sig2phi']))/nu
     else:
         if logistic:
             rab, beta0, betainf, alpha = beta
@@ -372,8 +387,8 @@ def intrinsic_moments_sph(R, z,
         sig2th = sig2r*(1 - beta)
         sig2phi = sig2r*(1 - gamma)
 
-    v2phi += nq.quad(integand_tan_dth_pot, xlim,
-                     args=(R**2, z**2, dens_pot, sigma_pot, qintr_pot))
+    v2phi += jnp.squeeze(nq.quad(integand_tan_dth_pot, xlim,
+                     args=(R**2, z**2, dens_pot, sigma_pot, qintr_pot)))
 
     return jnp.array([sig2r, sig2th, sig2phi, v2phi, nu])
 
@@ -393,8 +408,8 @@ def intrinsic_moments(Rbin, zbin, dens_lum, sigma_lum, qintr_lum, dens_pot,
             dens_lum, sigma_lum, qintr_lum, dens_pot, sigma_pot, qintr_pot,
             mbh, beta, gamma, logistic, epsrel)
         
-        vfunArgs = jnp.squeeze(jnp.vmap(funArgs,0,0))
-        A = vfunArgs(RzArgs)
+        vfunArgs = jax.vmap(funArgs,0,0)
+        A = jnp.squeeze(vfunArgs(RzArgs)).T
         sig2r, sig2th, sig2phi, v2phi, nu = A
         
     else:
@@ -457,8 +472,8 @@ class mom_interp:
             return res
        
         vfunArgs = jax.vmap(funArgs,0,0)
-        A= vfunArgs(RzArgs)
-        sig2r, sig2th, sig2phi, v2phi, nu = jnp.squeeze(A[0]), jnp.squeeze(A[1]), jnp.squeeze(A[2]), jnp.squeeze(A[3]), jnp.squeeze(A[4])
+        A = jnp.squeeze(vfunArgs(RzArgs)).T
+        sig2r, sig2th, sig2phi, v2phi, nu = A
         
 
         self.sig2r = sig2r.reshape(nang, nrad)

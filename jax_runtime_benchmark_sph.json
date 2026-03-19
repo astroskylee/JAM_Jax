@@ -1,0 +1,32 @@
+[
+  {
+    "mode": "segmented (log0, seg=8)",
+    "kind": "jax",
+    "first_s": 6.6073718770021515,
+    "post_mean_s": 0.49881783959936,
+    "post_std_s": 0.05141379740012338,
+    "post_min_s": 0.458243113997014,
+    "model_mean_first": 126.1873710866292,
+    "model_mean_post": 126.1873710866292
+  },
+  {
+    "mode": "pure GL",
+    "kind": "jax",
+    "first_s": 1.3348715689971868,
+    "post_mean_s": 0.4564213678000669,
+    "post_std_s": 0.05289939708203869,
+    "post_min_s": 0.4196926879994862,
+    "model_mean_first": 126.1873484235533,
+    "model_mean_post": 126.18734842355329
+  },
+  {
+    "mode": "base jampy 8.1.4",
+    "kind": "base",
+    "first_s": 13.022118364002381,
+    "post_mean_s": 16.404826382999453,
+    "post_std_s": 1.92085736393101,
+    "post_min_s": 13.778171147001558,
+    "model_mean_first": 125.20295812262819,
+    "model_mean_post": 125.20295812262819
+  }
+]
